@@ -41,6 +41,8 @@ type Payable struct {
 	ApprovedAt       *string         `json:"approved_at"`
 	Note             string          `json:"note"`
 	Adjustments      []Adjustment    `json:"adjustments"`
+	Frozen           bool            `json:"frozen"`
+	FreezeReason     string          `json:"freeze_reason,omitempty"`
 }
 
 type Adjustment struct {
@@ -71,6 +73,12 @@ type CalcPreview struct {
 // priceTrip computes a trip's payable without persisting it. It refuses to
 // compute when a required parameter is missing, so finance cannot pay on a gap.
 func (a *App) priceTrip(ctx context.Context, q querier, tripID int64) (CalcPreview, error) {
+	return a.priceTripWith(ctx, q, tripID, nil)
+}
+
+// priceTripWith is priceTrip with an optional assay override. Adjudication uses
+// it to trial what a specific side's result would pay without adopting it yet.
+func (a *App) priceTripWith(ctx context.Context, q querier, tripID int64, override *num.AssayInput) (CalcPreview, error) {
 	var p CalcPreview
 	trip, err := a.GetTrip(ctx, tripID, "")
 	if err != nil {
@@ -128,6 +136,9 @@ func (a *App) priceTrip(ctx context.Context, q querier, tripID int64) (CalcPrevi
 		CoefPPM:      coef,
 		UnitPriceCPT: contract.UnitPriceCentsPerT,
 	}
+	if override != nil {
+		in.Assay = *override
+	}
 	res, err := num.Compute(contract.FormulaCode, in)
 	if err != nil {
 		p.BlockedReason = err.Error()
@@ -152,71 +163,84 @@ func (a *App) ComputePayable(ctx context.Context, actor User, tripID int64, note
 	}
 	var id int64
 	err := a.DB.Tx(ctx, func(tx pgx.Tx) error {
-		// Lock the trip to serialise concurrent computations and races on the same
-		// remaining balance.
-		var locked int64
-		if err := tx.QueryRow(ctx, `select id from rt.trips where id=$1 for update`, tripID).Scan(&locked); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return notFound("trip %d", tripID)
-			}
-			return err
-		}
-		preview, err := a.priceTrip(ctx, tx, tripID)
-		if err != nil {
-			return err
-		}
-		if !preview.CanPay {
-			return blocked("无法计算应付：%s", preview.BlockedReason)
-		}
-		var prevID *int64
-		var prevVersion int
-		var prevAmount, prevMetal, prevWet int64
-		err = tx.QueryRow(ctx, `select id, version, amount_cents, metal_mg, wet_net_g from rt.payables
-			where trip_id=$1 and is_current for update`, tripID).Scan(&prevID, &prevVersion, &prevAmount, &prevMetal, &prevWet)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
-		}
-		version := prevVersion + 1
-		if prevID != nil {
-			if _, err := tx.Exec(ctx, `update rt.payables set is_current=false, status='superseded' where id=$1`, *prevID); err != nil {
-				return err
-			}
-		}
-		snapshot, err := json.Marshal(map[string]any{
-			"formula": preview.FormulaCode, "steps": preview.Result,
-			"contract": preview.ContractID, "adoption": preview.AdoptionID, "assay": preview.AssayID,
-			"grade": preview.GradeID, "computed_at": time.Now().UTC().Format(time.RFC3339),
-		})
-		if err != nil {
-			return err
-		}
-		err = tx.QueryRow(ctx, `insert into rt.payables(trip_id, version, is_current, supersedes_id, weight_adoption_id,
-			assay_id, grade_approval_id, contract_id, formula_snapshot, wet_net_g, dry_g, impurity_g, priced_g, metal_mg,
-			coef_ppm, unit_price_cents_per_t, amount_cents, status, computed_by, note)
-			values($1,$2,true,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'calculated',$17,$18) returning id`,
-			tripID, version, prevID, preview.AdoptionID, preview.AssayID, preview.GradeID, preview.ContractID,
-			snapshot, preview.Result.WetNetG, preview.Result.DryG, preview.Result.ImpurityG, preview.Result.PricedG,
-			preview.Result.MetalMg, preview.Result.CoefPPM, preview.Result.UnitPriceCPT, preview.Result.AmountCents,
-			actor.ID, note).Scan(&id)
-		if err != nil {
-			return err
-		}
-		if prevID != nil {
-			if _, err := tx.Exec(ctx, `insert into rt.payment_ledger(payable_id, trip_id, delta_cents, old_wet_net_g,
-				new_wet_net_g, old_metal_mg, new_metal_mg, reason, actor_id)
-				values($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, tripID, preview.Result.AmountCents-prevAmount,
-				prevWet, preview.Result.WetNetG, prevMetal, preview.Result.MetalMg, note, actor.ID); err != nil {
-				return err
-			}
-		}
-		return insertAudit(ctx, tx, actor, "payable.compute", "payable", id, map[string]any{
-			"trip_id": tripID, "version": version, "amount_cents": preview.Result.AmountCents,
-			"metal_mg": preview.Result.MetalMg, "wet_net_g": preview.Result.WetNetG})
+		var err error
+		id, err = a.computePayableTx(ctx, tx, actor, tripID, note)
+		return err
 	})
 	if err != nil {
 		return Payable{}, err
 	}
 	return a.GetPayable(ctx, id)
+}
+
+// computePayableTx writes a new current payable version inside an existing
+// transaction. Adjudication reuses it to rebuild the payment basis for an
+// unpaid trip after a determination.
+func (a *App) computePayableTx(ctx context.Context, tx pgx.Tx, actor User, tripID int64, note string) (int64, error) {
+	var id int64
+	// Lock the trip to serialise concurrent computations and races on the same
+	// remaining balance.
+	var locked int64
+	if err := tx.QueryRow(ctx, `select id from rt.trips where id=$1 for update`, tripID).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, notFound("trip %d", tripID)
+		}
+		return 0, err
+	}
+	preview, err := a.priceTrip(ctx, tx, tripID)
+	if err != nil {
+		return 0, err
+	}
+	if !preview.CanPay {
+		return 0, blocked("无法计算应付：%s", preview.BlockedReason)
+	}
+	var prevID *int64
+	var prevVersion int
+	var prevAmount, prevMetal, prevWet int64
+	err = tx.QueryRow(ctx, `select id, version, amount_cents, metal_mg, wet_net_g from rt.payables
+		where trip_id=$1 and is_current for update`, tripID).Scan(&prevID, &prevVersion, &prevAmount, &prevMetal, &prevWet)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return 0, err
+	}
+	version := prevVersion + 1
+	if prevID != nil {
+		if _, err := tx.Exec(ctx, `update rt.payables set is_current=false, status='superseded' where id=$1`, *prevID); err != nil {
+			return 0, err
+		}
+	}
+	snapshot, err := json.Marshal(map[string]any{
+		"formula": preview.FormulaCode, "steps": preview.Result,
+		"contract": preview.ContractID, "adoption": preview.AdoptionID, "assay": preview.AssayID,
+		"grade": preview.GradeID, "computed_at": time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return 0, err
+	}
+	err = tx.QueryRow(ctx, `insert into rt.payables(trip_id, version, is_current, supersedes_id, weight_adoption_id,
+		assay_id, grade_approval_id, contract_id, formula_snapshot, wet_net_g, dry_g, impurity_g, priced_g, metal_mg,
+		coef_ppm, unit_price_cents_per_t, amount_cents, status, computed_by, note)
+		values($1,$2,true,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'calculated',$17,$18) returning id`,
+		tripID, version, prevID, preview.AdoptionID, preview.AssayID, preview.GradeID, preview.ContractID,
+		snapshot, preview.Result.WetNetG, preview.Result.DryG, preview.Result.ImpurityG, preview.Result.PricedG,
+		preview.Result.MetalMg, preview.Result.CoefPPM, preview.Result.UnitPriceCPT, preview.Result.AmountCents,
+		actor.ID, note).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	if prevID != nil {
+		if _, err := tx.Exec(ctx, `insert into rt.payment_ledger(payable_id, trip_id, delta_cents, old_wet_net_g,
+			new_wet_net_g, old_metal_mg, new_metal_mg, reason, actor_id)
+			values($1,$2,$3,$4,$5,$6,$7,$8,$9)`, id, tripID, preview.Result.AmountCents-prevAmount,
+			prevWet, preview.Result.WetNetG, prevMetal, preview.Result.MetalMg, note, actor.ID); err != nil {
+			return 0, err
+		}
+	}
+	if err := insertAudit(ctx, tx, actor, "payable.compute", "payable", id, map[string]any{
+		"trip_id": tripID, "version": version, "amount_cents": preview.Result.AmountCents,
+		"metal_mg": preview.Result.MetalMg, "wet_net_g": preview.Result.WetNetG}); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 // PreviewPayable returns the calculation and the difference that a new version
@@ -280,6 +304,13 @@ func (a *App) ApprovePayable(ctx context.Context, actor User, payableID int64, n
 		if status != "calculated" && status != "held" {
 			return conflict("应付款状态 %s 不能批准", status)
 		}
+		// A supplier dispute freezes only this truck's payment; other trucks of
+		// the same supplier are unaffected.
+		if frozen, reason, err := activeFreeze(ctx, tx, tripID); err != nil {
+			return err
+		} else if frozen {
+			return blocked("本车处于复核争议冻结：%s", reason)
+		}
 		// Verify the approved grade still exists and is approved.
 		var gradeStatus string
 		if err := tx.QueryRow(ctx, `select status from rt.grade_approvals where trip_id=$1`, tripID).Scan(&gradeStatus); err != nil {
@@ -307,6 +338,15 @@ func (a *App) MarkPaid(ctx context.Context, actor User, payableID int64) (Payabl
 		return Payable{}, err
 	}
 	err := a.DB.Tx(ctx, func(tx pgx.Tx) error {
+		var tripID int64
+		if err := tx.QueryRow(ctx, `select trip_id from rt.payables where id=$1`, payableID).Scan(&tripID); err != nil {
+			return err
+		}
+		if frozen, reason, err := activeFreeze(ctx, tx, tripID); err != nil {
+			return err
+		} else if frozen {
+			return blocked("本车处于复核争议冻结：%s", reason)
+		}
 		tag, err := tx.Exec(ctx, `update rt.payables set status='paid' where id=$1 and status='approved' and is_current`, payableID)
 		if err != nil {
 			return err
@@ -355,6 +395,7 @@ func (a *App) GetPayable(ctx context.Context, id int64) (Payable, error) {
 		return p, err
 	}
 	p.Adjustments = adj
+	p.Frozen, p.FreezeReason, _ = activeFreeze(ctx, a.DB.Pool, p.TripID)
 	return p, nil
 }
 
@@ -533,14 +574,35 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 		return ReassayResult{}, err
 	}
 	var out ReassayResult
-	out.TripID = tripID
 	err := a.DB.Tx(ctx, func(tx pgx.Tx) error {
+		var err error
+		out, err = a.applyReassayTx(ctx, tx, actor, tripID)
+		return err
+	})
+	if err != nil {
+		return out, err
+	}
+	// Attach a payable preview outside the transaction.
+	if pv, err := a.PreviewPayable(ctx, tripID); err == nil {
+		out.Payable = &pv
+	}
+	return out, nil
+}
+
+// applyReassayTx propagates an adopted re-test to every stock node holding the
+// trip's material inside an existing transaction. Adjudication reuses it so a
+// determination changes both the payment basis and the mixed-pile metal in one
+// commit.
+func (a *App) applyReassayTx(ctx context.Context, tx pgx.Tx, actor User, tripID int64) (ReassayResult, error) {
+	var out ReassayResult
+	out.TripID = tripID
+	{
 		var locked int64
 		if err := tx.QueryRow(ctx, `select id from rt.trips where id=$1 for update`, tripID).Scan(&locked); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return notFound("trip %d", tripID)
+				return out, notFound("trip %d", tripID)
 			}
-			return err
+			return out, err
 		}
 		// The trip's intake net weight is the adopted weighing; the material may
 		// now live in downstream lots, so never read it from the original lot.
@@ -549,25 +611,25 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 			Scan(&intakeW)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				return blocked("车次 %d 尚无采用称次", tripID)
+				return out, blocked("车次 %d 尚无采用称次", tripID)
 			}
-			return err
+			return out, err
 		}
 		var origMetal int64
 		if err := tx.QueryRow(ctx, `select coalesce(sum(metal_mg),0) from rt.lot_origins where trip_id=$1`, tripID).
 			Scan(&origMetal); err != nil {
-			return err
+			return out, err
 		}
 		oldMetal := origMetal
 		pricing, err := computeTripMetal(ctx, tx, tripID)
 		if err != nil {
-			return err
+			return out, err
 		}
 		newTotal := pricing.MetalMg
 		out.OldIntakeMetalMg = oldMetal
 		out.NewIntakeMetalMg = newTotal
 		if intakeW <= 0 {
-			return blocked("车次入库净重为 0，无法按比例调整")
+			return out, blocked("车次入库净重为 0，无法按比例调整")
 		}
 
 		// Find every LIVE lot still holding this trip's origin. Consumed source
@@ -582,20 +644,20 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 			join rt.inventory_lots l on l.id=o.lot_id
 			where o.trip_id=$1 and o.weight_g > 0 and l.weight_g > 0 order by o.lot_id`, tripID)
 		if err != nil {
-			return err
+			return out, err
 		}
 		var list []lotOrig
 		for rows.Next() {
 			var lo lotOrig
 			if err := rows.Scan(&lo.lotID, &lo.weight, &lo.old); err != nil {
 				rows.Close()
-				return err
+				return out, err
 			}
 			list = append(list, lo)
 		}
 		rows.Close()
 		if len(list) == 0 {
-			return blocked("车次 %d 没有存量来源记录", tripID)
+			return out, blocked("车次 %d 没有存量来源记录", tripID)
 		}
 		// New metal per origin weight; the sum must equal newTotal exactly.
 		// Scale metal in proportion to each live origin's CURRENT metal, not its
@@ -609,7 +671,7 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 			oldLiveMetal += lo.old
 		}
 		if oldLiveMetal <= 0 {
-			return blocked("车次 %d 存量不含金属，无法按品位调整", tripID)
+			return out, blocked("车次 %d 存量不含金属，无法按品位调整", tripID)
 		}
 		newVals := num.Alloc(newTotal, oldMetals)
 		_ = intakeW
@@ -623,23 +685,23 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 			}
 			if _, err := tx.Exec(ctx, `update rt.lot_origins set metal_mg=$3 where lot_id=$1 and trip_id=$2`,
 				lo.lotID, tripID, newVals[i]); err != nil {
-				return err
+				return out, err
 			}
 			if _, err := tx.Exec(ctx, `update rt.inventory_lots set metal_mg=greatest(metal_mg+$2,0), updated_at=now()
 				where id=$1`, lo.lotID, delta); err != nil {
-				return err
+				return out, err
 			}
 			if _, err := tx.Exec(ctx, `insert into rt.lot_events(lot_id, event, weight_g, metal_mg, pile_id, occurred_at, detail)
 				select $1,'metal_adjust',$2,$3,pile_id, now(), jsonb_build_object('trip_id',$4::bigint,'delta_mg',$5::bigint)
 				from rt.inventory_lots where id=$1`, lo.lotID, lo.weight, newVals[i], tripID, delta); err != nil {
-				return err
+				return out, err
 			}
 			var key, pileName, pileKind, state string
 			var w int64
 			if err := tx.QueryRow(ctx, `select l.lot_key, p.name, p.kind, l.state, l.weight_g
 				from rt.inventory_lots l join rt.piles p on p.id=l.pile_id where l.id=$1`, lo.lotID).
 				Scan(&key, &pileName, &pileKind, &state, &w); err != nil {
-				return err
+				return out, err
 			}
 			out.AffectedLots = append(out.AffectedLots, AffectedLot{LotID: lo.lotID, LotKey: key,
 				PileName: pileName, PileKind: pileKind, State: state, WeightG: w,
@@ -648,15 +710,10 @@ func (a *App) ApplyReassay(ctx context.Context, actor User, tripID int64) (Reass
 		if out.AffectedLots == nil {
 			out.AffectedLots = []AffectedLot{}
 		}
-		return insertAudit(ctx, tx, actor, "assay.reassay", "trip", tripID, map[string]any{
-			"old_metal_mg": oldMetal, "new_metal_mg": newTotal, "lots": len(out.AffectedLots)})
-	})
-	if err != nil {
-		return out, err
-	}
-	// Attach a payable preview outside the transaction.
-	if pv, err := a.PreviewPayable(ctx, tripID); err == nil {
-		out.Payable = &pv
+		if err := insertAudit(ctx, tx, actor, "assay.reassay", "trip", tripID, map[string]any{
+			"old_metal_mg": oldMetal, "new_metal_mg": newTotal, "lots": len(out.AffectedLots)}); err != nil {
+			return out, err
+		}
 	}
 	return out, nil
 }

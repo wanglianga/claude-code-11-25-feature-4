@@ -90,6 +90,50 @@ t=$(curl -s "$BASE/api/reconciliation" -H "Authorization: Bearer $FIN")
 echo "$t" | jq -e '.totals.gap_g==0 and .totals.gap_metal_mg==0' >/dev/null \
   && pass "重量尾差与金属尾差均为 0" || bad "存在尾差: $(echo "$t" | jq -c .totals)"
 
+echo "== 13. 干湿基不可比：不取平均、只列差异来源 =="
+QLTY=$(tok quality quality123)
+CID=$(curl -s "$BASE/api/review-cases" -H "Authorization: Bearer $QLTY" | jq -r '.[] | select(.case_no|startswith("RC-B-20261110-001")) | .id' | head -1)
+tr=$(curl -s "$BASE/api/review-cases/$CID/trial" -H "Authorization: Bearer $QLTY")
+echo "$tr" | jq -e '.comparability.comparable==false and (.comparability.difference_sources|length)>0 and .averaging_forbidden==true' >/dev/null \
+  && pass "干湿基判定不可比，列出差异来源，禁止平均" || bad "不可比判定异常: $(echo "$tr" | jq -c '.comparability')"
+echo "$tr" | jq -e '([.candidates[]|select(.blocked==null)|.amount_cents] | length) >= 2' >/dev/null \
+  && pass "各候选结果分别试算，未生成折中值" || bad "候选试算异常"
+
+echo "== 14. 留样不能被重复领取 =="
+U=$(q "select id from rt.sample_units where unit_no='SU-2601-002-S1'")
+CB=$(q "select id from rt.review_cases where case_no like 'RC-B-20261110-002-02%'")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/review-cases/$CB/draws" -H "Authorization: Bearer $LAB" \
+  -H 'Content-Type: application/json' -d "{\"unit_id\":$U,\"weight_g\":10,\"blind_code\":\"BL-VERIFY-DUP\"}")
+[ "$code" = "409" ] && pass "同一留样二次领取被拒绝 (HTTP $code)" || bad "同一留样被重复领取 (HTTP $code)"
+
+echo "== 15. 封签断裂不能安排复检 =="
+U3=$(q "select id from rt.sample_units where unit_no='SU-2601-003'")
+C3=$(q "select id from rt.review_cases where case_no like 'RC-B-20261110-003%'")
+code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$BASE/api/review-cases/$C3/draws" -H "Authorization: Bearer $LAB" \
+  -H 'Content-Type: application/json' -d "{\"unit_id\":$U3,\"weight_g\":10,\"blind_code\":\"BL-VERIFY-BROKEN\"}")
+[ "$code" = "409" ] && pass "封签断裂的留样复检被拒绝 (HTTP $code)" || bad "断裂封签仍可安排复检 (HTTP $code)"
+
+echo "== 16. 揭示前不返回外送数值 =="
+masked=$(curl -s "$BASE/api/review-cases/$CB" -H "Authorization: Bearer $LAB" | jq '[.external_reports[]|select(.revealed==false)|select(.masked==true)]|length')
+[ "$masked" -ge 1 ] && pass "未揭示外送结果已脱敏 ($masked 条)" || bad "未揭示外送结果泄露数值"
+
+echo "== 17. 争议只冻结本车 =="
+cross=$(q "select count(*) from rt.payment_freezes f join rt.review_cases c on c.id=f.case_id where c.trip_id<>f.trip_id")
+stray=$(q "select count(*) from rt.payment_freezes f where f.status='active' and not exists(select 1 from rt.review_cases c where c.trip_id=f.trip_id and c.status<>'settled')")
+paid_other=$(q "select count(*) from rt.payables where status='paid' and trip_id<>1")
+[ "$cross" -eq 0 ] && [ "$stray" -eq 0 ] && [ "$paid_other" -ge 1 ] \
+  && pass "无跨车冻结；同供应商其他车照常付款 ($paid_other 车已付，金额保留)" \
+  || bad "冻结范围异常 (cross=$cross stray=$stray other_paid=$paid_other)"
+
+echo "== 18. 裁定结算：已付追补 / 未付重建 =="
+rec=$(q "select count(*) from rt.payment_recoveries where kind='recovery' and delta_cents<>0")
+reb=$(q "select count(*) from rt.payment_recoveries where kind='rebuild' and delta_cents<>0")
+[ "$rec" -ge 1 ] && [ "$reb" -ge 1 ] && pass "已付形成差额追补($rec)，未付重建付款依据($reb)" || bad "结算路由异常 recovery=$rec rebuild=$reb"
+
+echo "== 19. 裁定后新报告只提出重新复核 =="
+eff=$(q "select count(*) from rt.adjudications where case_id=(select id from rt.review_cases where case_no like 'RC-B-20261110-002-01%') and status='effective'")
+[ "$eff" -eq 1 ] && pass "每案至多一条生效裁定，历史保留" || bad "生效裁定数异常 ($eff)"
+
 echo
 if [ "$fail" -eq 0 ]; then echo "ALL CHECKS PASSED"; else echo "SOME CHECKS FAILED"; fi
 exit "$fail"

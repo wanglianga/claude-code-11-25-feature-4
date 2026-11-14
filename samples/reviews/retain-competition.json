@@ -1,0 +1,17 @@
+[
+  {
+    "_comment": "留样竞争：同一留样单元只能被一个案件领取。第二个案件必须改用分样单元，否则被拒。",
+    "case_no": "RC-B-20261110-002-01",
+    "draw": { "unit_no": "SU-2601-002-S1", "weight_g": 200, "blind_code": "BL-2601-002", "lab_name": "SGS 第三方" }
+  },
+  {
+    "case_no": "RC-B-20261110-002-02",
+    "draw": { "unit_no": "SU-2601-002-S1", "weight_g": 100, "blind_code": "BL-2601-003", "lab_name": "另一家实验室" },
+    "_expect": "rejected: 该留样已被领取，同一留样不能重复使用"
+  },
+  {
+    "case_no": "RC-B-20261110-002-02",
+    "draw": { "unit_no": "SU-2601-002", "weight_g": 300, "blind_code": "BL-2601-005", "lab_name": "另一家实验室" },
+    "_expect": "accepted: 改用原留样剩余量"
+  }
+]

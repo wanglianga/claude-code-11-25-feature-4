@@ -71,6 +71,24 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/assays/{id}/reject", s.authed(s.handleRejectAssay, "quality,admin"))
 	m.HandleFunc("POST /api/samples/{id}/assays", s.authed(s.handleAddAssay, "lab,admin"))
 
+	// 留样、封签流转与复核裁定
+	m.HandleFunc("POST /api/samples/{id}/units", s.authed(s.handleRegisterUnit, "lab,yard,admin"))
+	m.HandleFunc("GET /api/trips/{id}/sample-units", s.authed(s.handleListSampleUnits, ""))
+	m.HandleFunc("GET /api/sample-units/{id}", s.authed(s.handleGetSampleUnit, ""))
+	m.HandleFunc("POST /api/sample-units/{id}/split", s.authed(s.handleSplitUnit, "lab,yard,admin"))
+	m.HandleFunc("POST /api/sample-units/{id}/break-seal", s.authed(s.handleBreakSeal, "lab,yard,quality,admin"))
+
+	m.HandleFunc("GET /api/review-cases", s.authed(s.handleReviewCases, ""))
+	m.HandleFunc("POST /api/trips/{id}/review-cases", s.authed(s.handleOpenReviewCase, "quality,lab,admin"))
+	m.HandleFunc("GET /api/review-cases/{id}", s.authed(s.handleGetReviewCase, ""))
+	m.HandleFunc("POST /api/review-cases/{id}/party-reports", s.authed(s.handleAddPartyReport, "quality,lab,purchasing,admin"))
+	m.HandleFunc("POST /api/review-cases/{id}/draws", s.authed(s.handleDrawSample, "lab,yard,quality,admin"))
+	m.HandleFunc("POST /api/review-cases/{id}/external-return", s.authed(s.handleExternalReturn, "lab,quality,admin"))
+	m.HandleFunc("POST /api/review-cases/{id}/reveal", s.authed(s.handleRevealExternal, "quality,admin"))
+	m.HandleFunc("GET /api/review-cases/{id}/trial", s.authed(s.handleTrialReview, ""))
+	m.HandleFunc("POST /api/review-cases/{id}/adjudicate", s.authed(s.handleAdjudicate, "quality,admin"))
+	m.HandleFunc("GET /api/payment-recoveries", s.authed(s.handleRecoveries, ""))
+
 	m.HandleFunc("GET /api/stock", s.authed(s.handleStock, ""))
 	m.HandleFunc("GET /api/lots/{id}", s.authed(s.handleGetLot, ""))
 	m.HandleFunc("GET /api/lots/{id}/trace", s.authed(s.handleTrace, ""))

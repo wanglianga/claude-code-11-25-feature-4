@@ -494,3 +494,191 @@ func (s *Server) handleIngestTransfers(w http.ResponseWriter, r *http.Request, u
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": out})
 }
+
+// ------------------------------------------------------------------ 留样与复核
+
+func (s *Server) handleRegisterUnit(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.RegisterUnitInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.RegisterSealedUnit(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleListSampleUnits(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.ListSampleUnits(r.Context(), pathID(r, "id"))
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleGetSampleUnit(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.GetSampleUnit(r.Context(), pathID(r, "id"))
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleSplitUnit(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.SplitUnitInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.SplitSampleUnit(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleBreakSeal(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.BreakSealInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.BreakSeal(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleReviewCases(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.ListReviewCases(r.Context())
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleOpenReviewCase(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.OpenCaseInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.OpenReviewCase(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleGetReviewCase(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.GetReviewCase(r.Context(), u, pathID(r, "id"))
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleAddPartyReport(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.PartyReportInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.AddPartyReport(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleDrawSample(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in struct {
+		UnitID    int64  `json:"unit_id"`
+		WeightG   int64  `json:"weight_g"`
+		BlindCode string `json:"blind_code"`
+		LabName   string `json:"lab_name"`
+	}
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.DrawSampleUnit(r.Context(), u, pathID(r, "id"), in.UnitID,
+		app.DrawInput{WeightG: in.WeightG, BlindCode: in.BlindCode, LabName: in.LabName})
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (s *Server) handleExternalReturn(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.ExternalReturnInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.ReturnExternalReport(r.Context(), u, in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleRevealExternal(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in struct {
+		ExternalReportID int64  `json:"external_report_id"`
+		Note             string `json:"note"`
+	}
+	_ = decode(r, &in)
+	out, err := s.App.RevealExternalReport(r.Context(), u, in.ExternalReportID, in.Note)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleTrialReview(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.TrialReview(r.Context(), pathID(r, "id"))
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleAdjudicate(w http.ResponseWriter, r *http.Request, u app.User) {
+	var in app.AdjudicateInput
+	if err := decode(r, &in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误: "+err.Error())
+		return
+	}
+	out, err := s.App.Adjudicate(r.Context(), u, pathID(r, "id"), in)
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (s *Server) handleRecoveries(w http.ResponseWriter, r *http.Request, u app.User) {
+	out, err := s.App.ListRecoveries(r.Context())
+	if err != nil {
+		writeAppErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}

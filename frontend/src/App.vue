@@ -24,6 +24,7 @@ const nav = [
   { to: '/trips', label: '车次与来料' },
   { to: '/stock', label: '料堆与追溯' },
   { to: '/movements', label: '转移单' },
+  { to: '/reviews', label: '封样复核' },
   { to: '/payables', label: '应付款' },
   { to: '/reconciliation', label: '数量金额核对' },
 ]

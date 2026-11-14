@@ -17,7 +17,10 @@ func (a *App) ResetDemo(ctx context.Context) (string, error) {
 	_, err := a.DB.Pool.Exec(ctx, `truncate rt.audit_log, rt.payment_ledger, rt.payables, rt.transfer_lines,
 		rt.lot_events, rt.lot_links, rt.lot_origins, rt.loss_attribution, rt.inventory_lots, rt.movements, rt.grade_approvals,
 		rt.trip_assay_adoptions, rt.assay_results, rt.samples, rt.weight_adoptions, rt.weighings, rt.trips,
-		rt.contract_grades, rt.contracts, rt.piles, rt.suppliers restart identity cascade`)
+		rt.contract_grades, rt.contracts, rt.piles, rt.suppliers,
+		rt.payment_recoveries, rt.adjudication_lines, rt.adjudications, rt.rereview_requests,
+		rt.payment_freezes, rt.external_reports, rt.party_reports, rt.sample_draws,
+		rt.sample_seal_events, rt.review_cases, rt.sample_units restart identity cascade`)
 	if err != nil {
 		return "", err
 	}
@@ -346,7 +349,221 @@ func (a *App) SeedDemo(ctx context.Context) error {
 	if after := a.pileWeight(ctx, piles["SHIP-1"]); after != before {
 		return fmt.Errorf("replay moved material: %d -> %d", before, after)
 	}
+	// ---------------- 留样、封样复核与差异裁定 ----------------
+	if err := a.seedReviewStory(ctx, users, trip1, trip2, s1, s2); err != nil {
+		return err
+	}
 	return nil
+}
+
+// seedReviewStory adds three retained-sample scenarios on top of the base
+// story:
+//
+//	A. 干湿基不可比：供应商报干基金属、厂内报湿基金属，平台只列差异来源，
+//	   不生成平均/折中值；外送盲样揭示后按外送结果裁定，未付款重建付款依据。
+//	B. 留样竞争：原留样分样后，同一单元被第一个案件领取，第二个案件不能重复
+//	   使用；改用另一单元才成功。已付款按差额形成追补/追回。
+//	C. 封签断裂：留样封签断裂，复检不能被照常安排，案件转待补证。
+//	另外演示：某一车被争议冻结时，同供应商其他车照常计算并付款。
+func (a *App) seedReviewStory(ctx context.Context, users map[string]User, trip1, trip2 Trip, s1, s2 Sample) error {
+	purchasing, yard, lab, quality, finance := users["purchasing"], users["yard"], users["lab"], users["quality"], users["finance"]
+
+	// ---- A. 第 1 车：原留样 + 分样，供应商/厂内报告 + 外送盲样 ----
+	u1, err := a.RegisterSealedUnit(ctx, lab, s1.ID, RegisterUnitInput{
+		UnitNo: "SU-2601-001", Position: "车厢前部", SealNo: "SEAL-8811", InitialG: 1200,
+		Note: "原封样，三点取样混合后留样 1.2kg"})
+	if err != nil {
+		return fmt.Errorf("register unit A: %w", err)
+	}
+	// 分样 400g 用于外送，原单元保留 800g。
+	split, err := a.SplitSampleUnit(ctx, lab, u1.ID, SplitUnitInput{
+		UnitNo: "SU-2601-001-S1", SealNo: "SEAL-8811-S1", WeightG: 400,
+		Note: "分出 400g 外送第三方，原单元继续留存"})
+	if err != nil {
+		return fmt.Errorf("split unit A: %w", err)
+	}
+	caseA, err := a.OpenReviewCase(ctx, quality, trip1.ID, OpenCaseInput{
+		SampleID: s1.ID, SampleUnitID: u1.ID, SamePosition: true,
+		MetalTolerancePPM: 2_000, MoistureTolerancePPM: 2_000,
+		Note: "供应商对复检下调后的含铜量提出异议，冻结本车付款"})
+	if err != nil {
+		return fmt.Errorf("open case A: %w", err)
+	}
+	// 供应商报告：干基，金属 63.0%，水分 3.1% —— 高于厂内采用值。
+	if _, err := a.AddPartyReport(ctx, purchasing, caseA.ID, PartyReportInput{
+		Party: "supplier", ReportNo: "SUP-A-20261112-01", LabName: "供应商委托化验室",
+		SampleNo: s1.SampleNo, SealNo: "SEAL-8811", Position: "车厢前部",
+		DeclaredUnit: "%", MoisturePPM: 31_000, ImpurityPPM: i64p(16_000), ImpurityBasis: "dry",
+		MetalPPM: 630_000, MetalBasis: "dry", QuoteCentsPerT: 5_800_000,
+	}); err != nil {
+		return fmt.Errorf("supplier report A: %w", err)
+	}
+	// 厂内报告：湿基金属 60.9% —— 与供应商干基不可比。
+	if _, err := a.AddPartyReport(ctx, lab, caseA.ID, PartyReportInput{
+		Party: "plant", ReportNo: "IN-20261112-A", LabName: "厂内化验室",
+		SampleNo: s1.SampleNo, SealNo: "SEAL-8811", Position: "车厢前部",
+		DeclaredUnit: "%", MoisturePPM: 31_500, ImpurityPPM: i64p(15_500), ImpurityBasis: "wet",
+		MetalPPM: 609_000, MetalBasis: "wet",
+	}); err != nil {
+		return fmt.Errorf("plant report A: %w", err)
+	}
+	// 外送：从分样单元领取，盲编号关联；返回时带正确封签 => 可揭示。
+	drawn, err := a.DrawSampleUnit(ctx, lab, caseA.ID, split.ID, DrawInput{
+		WeightG: 300, BlindCode: "BL-2601-001", LabName: "SGS 第三方"})
+	if err != nil {
+		return fmt.Errorf("draw split A: %w", err)
+	}
+	if _, err := a.ReturnExternalReport(ctx, lab, ExternalReturnInput{
+		BlindCode: drawn.BlindCode, LabName: "SGS 第三方", SampleNo: s1.SampleNo, SealNo: split.SealNo,
+		Position: "车厢前部", DeclaredUnit: "%", MoisturePPM: 31_200, ImpurityPPM: i64p(15_800),
+		ImpurityBasis: "dry", MetalPPM: 618_500, MetalBasis: "dry", Note: "第三方比对结果",
+	}); err != nil {
+		return fmt.Errorf("external return A: %w", err)
+	}
+	var extA int64
+	if err := a.DB.Pool.QueryRow(ctx, `select id from rt.external_reports where blind_code='BL-2601-001'`).Scan(&extA); err != nil {
+		return err
+	}
+	if _, err := a.RevealExternalReport(ctx, quality, extA, "盲编号与留样封签一致，正式揭示"); err != nil {
+		return fmt.Errorf("reveal A: %w", err)
+	}
+	// 争议只冻结第 1 车。第 3 车同属供应商 A，仍可正常计算并付款。
+	var trip3 Trip
+	if err := a.DB.Pool.QueryRow(ctx, `select id from rt.trips where batch_no='B-20261110-003'`).Scan(&trip3.ID); err != nil {
+		return err
+	}
+	pay3, err := a.ComputePayable(ctx, finance, trip3.ID, "隔离料照合同计价；本车未涉争议，正常出账")
+	if err != nil {
+		return fmt.Errorf("trip3 payable: %w", err)
+	}
+	if _, err := a.ApprovePayable(ctx, finance, pay3.ID, "同供应商第 3 车未冻结，正常批准"); err != nil {
+		return fmt.Errorf("trip3 approve while trip1 frozen: %w", err)
+	}
+	if _, err := a.MarkPaid(ctx, finance, pay3.ID); err != nil {
+		return fmt.Errorf("trip3 pay: %w", err)
+	}
+	// 采用外送结果裁定（原案干湿基不可比，说明来源后用第三方实测）。
+	caseA, err = a.GetReviewCase(ctx, quality, caseA.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := a.Adjudicate(ctx, quality, caseA.ID, AdjudicateInput{
+		ExpectedEvidenceVersion: caseA.EvidenceVersion, Adopted: "external", ExternalReportID: extA,
+		Reason: "供应商为干基、厂内为湿基，不能直接平均；以外送第三方同基准实测为准",
+	}); err != nil {
+		return fmt.Errorf("adjudicate A: %w", err)
+	}
+
+	// ---- B. 留样竞争：同一留样不能被多次复核重复使用 ----
+	u2, err := a.RegisterSealedUnit(ctx, lab, s2.ID, RegisterUnitInput{
+		UnitNo: "SU-2601-002", Position: "车厢中部", SealNo: "SEAL-8812", InitialG: 500,
+		Note: "第 2 车原留样 500g"})
+	if err != nil {
+		return fmt.Errorf("register unit B: %w", err)
+	}
+	// 先分样 200g，原单元余 300g。
+	split2, err := a.SplitSampleUnit(ctx, lab, u2.ID, SplitUnitInput{
+		UnitNo: "SU-2601-002-S1", SealNo: "SEAL-8812-S1", WeightG: 200, Note: "分出 200g 供首次复核"})
+	if err != nil {
+		return fmt.Errorf("split unit B: %w", err)
+	}
+	// 第 2 车先付款，之后再开案：这样裁定后差额形成追补/追回，而不是重建。
+	pay2, err := a.currentPayableID(ctx, trip2.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := a.MarkPaid(ctx, finance, pay2); err != nil {
+		return fmt.Errorf("pay trip2 before dispute: %w", err)
+	}
+	caseB1, err := a.OpenReviewCase(ctx, quality, trip2.ID, OpenCaseInput{
+		SampleID: s2.ID, SampleUnitID: split2.ID, SamePosition: true, Note: "首次复核：供应商质疑品位"})
+	if err != nil {
+		return err
+	}
+	if _, err := a.AddPartyReport(ctx, purchasing, caseB1.ID, PartyReportInput{
+		Party: "supplier", ReportNo: "SUP-A-20261112-02", SampleNo: s2.SampleNo, SealNo: "SEAL-8812-S1",
+		Position: "车厢中部", DeclaredUnit: "%", MoisturePPM: 30_000, ImpurityPPM: i64p(14_000),
+		ImpurityBasis: "dry", MetalPPM: 620_000, MetalBasis: "dry", QuoteCentsPerT: 5_800_000,
+	}); err != nil {
+		return err
+	}
+	if _, err := a.AddPartyReport(ctx, lab, caseB1.ID, PartyReportInput{
+		Party: "plant", ReportNo: "IN-20261112-B", SampleNo: s2.SampleNo, SealNo: "SEAL-8812-S1",
+		Position: "车厢中部", DeclaredUnit: "%", MoisturePPM: 30_100, ImpurityPPM: i64p(14_100),
+		ImpurityBasis: "dry", MetalPPM: 619_000, MetalBasis: "dry",
+	}); err != nil {
+		return err
+	}
+	// 第一个案件领取分样单元 200g，占用该单元。
+	if _, err := a.DrawSampleUnit(ctx, lab, caseB1.ID, split2.ID, DrawInput{
+		WeightG: 200, BlindCode: "BL-2601-002", LabName: "SGS 第三方"}); err != nil {
+		return fmt.Errorf("first draw B: %w", err)
+	}
+	// 第二个案件尝试领取同一单元 => 必须被拒绝（同一留样不可重复使用）。
+	caseB2, err := a.OpenReviewCase(ctx, quality, trip2.ID, OpenCaseInput{
+		SampleID: s2.ID, SampleUnitID: u2.ID, SamePosition: true,
+		Note: "第二次复核：先试同一单元（应被阻断），改用原留样余量"})
+	if err != nil {
+		return err
+	}
+	if _, err := a.DrawSampleUnit(ctx, lab, caseB2.ID, split2.ID, DrawInput{
+		WeightG: 100, BlindCode: "BL-2601-003", LabName: "另一家实验室"}); err == nil {
+		return fmt.Errorf("the same retained unit was drawn twice")
+	}
+	// 第二个案件改用原单元剩余量（300g）才合规。
+	if _, err := a.DrawSampleUnit(ctx, lab, caseB2.ID, u2.ID, DrawInput{
+		WeightG: 300, BlindCode: "BL-2601-005", LabName: "另一家实验室"}); err != nil {
+		return fmt.Errorf("draw alternate unit B: %w", err)
+	}
+	// 第 2 车已付款，裁定后按差额形成追补/追回。
+	caseB, err := a.GetReviewCase(ctx, quality, caseB1.ID)
+	if err != nil {
+		return err
+	}
+	if _, err := a.Adjudicate(ctx, quality, caseB1.ID, AdjudicateInput{
+		ExpectedEvidenceVersion: caseB.EvidenceVersion, Adopted: "plant",
+		PartyReportID: caseB.PartyReports[1].ID,
+		Reason:        "双方同为干基且差值在约定 ±2000 ppm 内，按约定采用厂内结果，不取平均",
+	}); err != nil {
+		return fmt.Errorf("adjudicate B: %w", err)
+	}
+
+	// ---- C. 封签断裂：不能照常安排复检 ----
+	var s3id int64
+	if err := a.DB.Pool.QueryRow(ctx, `select s.id from rt.samples s where s.trip_id=$1`, trip3.ID).Scan(&s3id); err != nil {
+		return err
+	}
+	u3, err := a.RegisterSealedUnit(ctx, lab, s3id, RegisterUnitInput{
+		UnitNo: "SU-2601-003", Position: "车厢后部", SealNo: "SEAL-8813", InitialG: 600,
+		Note: "隔离料留样"})
+	if err != nil {
+		return err
+	}
+	if _, err := a.BreakSeal(ctx, yard, u3.ID, BreakSealInput{Reason: "运输途中封签拉断，封条编号不可辨认"}); err != nil {
+		return err
+	}
+	caseC, err := a.OpenReviewCase(ctx, quality, trip3.ID, OpenCaseInput{
+		SampleID: s3id, SampleUnitID: u3.ID, Note: "封签断裂，复核转待补证"})
+	if err != nil {
+		return err
+	}
+	if _, err := a.DrawSampleUnit(ctx, lab, caseC.ID, u3.ID, DrawInput{
+		WeightG: 150, BlindCode: "BL-2601-004", LabName: "SGS 第三方"}); err == nil {
+		return fmt.Errorf("a broken seal was scheduled for re-testing")
+	}
+	return nil
+}
+
+// currentPayableID returns the trip's current payable version id.
+func (a *App) currentPayableID(ctx context.Context, tripID int64) (int64, error) {
+	var id int64
+	if err := a.DB.Pool.QueryRow(ctx, `select id from rt.payables where trip_id=$1 and is_current`, tripID).Scan(&id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, blocked("车次 %d 尚无当前应付版本", tripID)
+		}
+		return 0, err
+	}
+	return id, nil
 }
 
 func (a *App) lotIDForKey(ctx context.Context, key string) (int64, error) {

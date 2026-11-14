@@ -1,0 +1,7 @@
+{
+  "_comment": "封签断裂：留样封签断裂后，复检不能被照常安排；案件转待补证。",
+  "unit_no": "SU-2601-003",
+  "break_seal": { "reason": "运输途中封签拉断，封条编号不可辨认" },
+  "attempted_draw": { "weight_g": 150, "blind_code": "BL-2601-004", "lab_name": "SGS 第三方" },
+  "_expect": "rejected: 留样封签已断裂，不能照常安排复检"
+}

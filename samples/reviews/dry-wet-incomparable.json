@@ -1,0 +1,34 @@
+[
+  {
+    "_comment": "干湿基不可比：供应商按干基申报，厂内按湿基申报。平台不会把两份品位平均，只列差异来源。",
+    "case_no": "RC-B-20261110-001-01",
+    "party": "supplier",
+    "report_no": "SUP-A-20261112-01",
+    "lab_name": "供应商委托化验室",
+    "sample_no": "SMP-2601-001",
+    "seal_no": "SEAL-8811",
+    "position": "车厢前部",
+    "declared_unit": "%",
+    "moisture_ppm": 31000,
+    "impurity_ppm": 16000,
+    "impurity_basis": "dry",
+    "metal_ppm": 630000,
+    "metal_basis": "dry",
+    "quote_cents_per_t": 5800000
+  },
+  {
+    "case_no": "RC-B-20261110-001-01",
+    "party": "plant",
+    "report_no": "IN-20261112-A",
+    "lab_name": "厂内化验室",
+    "sample_no": "SMP-2601-001",
+    "seal_no": "SEAL-8811",
+    "position": "车厢前部",
+    "declared_unit": "%",
+    "moisture_ppm": 31500,
+    "impurity_ppm": 15500,
+    "impurity_basis": "wet",
+    "metal_ppm": 609000,
+    "metal_basis": "wet"
+  }
+]
